@@ -1,17 +1,17 @@
 import argparse
-import os
+import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+from urllib.parse import quote
 
 import pandas as pd
-import requests
-from dotenv import load_dotenv
 from openpyxl.utils import get_column_letter
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
-TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
-GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+
+BASE_MAPS_SEARCH_URL = "https://www.google.com/maps/search/"
 
 
 def load_keywords_from_txt(path: Optional[str]) -> List[str]:
@@ -29,89 +29,6 @@ def load_keywords_from_txt(path: Optional[str]) -> List[str]:
             keywords.append(normalized)
 
     return keywords
-
-
-def geocode_city_country(api_key: str, city: str, country: str) -> str:
-    query = f"{city}, {country}"
-    params = {"address": query, "key": api_key, "language": "tr"}
-    resp = requests.get(GEOCODE_URL, params=params, timeout=30)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    status = payload.get("status")
-    if status != "OK" or not payload.get("results"):
-        raise RuntimeError(f"Geocode API hata durumu: {status} | {payload}")
-
-    loc = payload["results"][0]["geometry"]["location"]
-    return f"{loc['lat']},{loc['lng']}"
-
-
-def text_search(api_key: str, query: str, location: str, radius: int, max_results: int) -> List[Dict]:
-    results: List[Dict] = []
-    next_page_token: Optional[str] = None
-
-    while len(results) < max_results:
-        params = {
-            "key": api_key,
-            "query": query,
-            "location": location,
-            "radius": radius,
-            "language": "tr",
-        }
-
-        if next_page_token:
-            params = {"key": api_key, "pagetoken": next_page_token}
-            time.sleep(2)
-
-        resp = requests.get(TEXT_SEARCH_URL, params=params, timeout=30)
-        resp.raise_for_status()
-        payload = resp.json()
-
-        status = payload.get("status")
-        if status not in {"OK", "ZERO_RESULTS"}:
-            raise RuntimeError(f"Text Search API hata durumu: {status} | {payload}")
-
-        page_results = payload.get("results", [])
-        if not page_results:
-            break
-
-        results.extend(page_results)
-        if len(results) >= max_results:
-            break
-
-        next_page_token = payload.get("next_page_token")
-        if not next_page_token:
-            break
-
-    return results[:max_results]
-
-
-def place_details(api_key: str, place_id: str) -> Dict:
-    fields = ",".join(
-        [
-            "place_id",
-            "name",
-            "formatted_address",
-            "formatted_phone_number",
-            "website",
-            "rating",
-            "user_ratings_total",
-            "types",
-            "url",
-            "business_status",
-        ]
-    )
-
-    params = {"key": api_key, "place_id": place_id, "fields": fields, "language": "tr"}
-    resp = requests.get(DETAILS_URL, params=params, timeout=30)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    status = payload.get("status")
-    if status != "OK":
-        raise RuntimeError(f"Details API hata durumu: {status} | {payload}")
-
-    return payload.get("result", {})
 
 
 def build_queries(
@@ -150,66 +67,216 @@ def build_queries(
     return final_queries
 
 
-def should_exclude(details: Dict, exclude_terms: List[str]) -> bool:
+def parse_rating(aria_label: str) -> Optional[float]:
+    if not aria_label:
+        return None
+    m = re.search(r"([0-9]+(?:[\.,][0-9]+)?)", aria_label)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", "."))
+
+
+def extract_first_text(page, selectors: List[str]) -> Optional[str]:
+    for selector in selectors:
+        locator = page.locator(selector).first
+        if locator.count() > 0:
+            text = locator.inner_text().strip()
+            if text:
+                return text
+    return None
+
+
+def extract_place_id_from_url(url: str) -> Optional[str]:
+    if not url:
+        return None
+
+    m = re.search(r"!1s([^!]+)", url)
+    if m:
+        return m.group(1)
+
+    m2 = re.search(r"/place/([^/]+)/", url)
+    if m2:
+        return m2.group(1)
+
+    return None
+
+
+def should_exclude(name: str, category_text: str, exclude_terms: List[str]) -> bool:
     if not exclude_terms:
         return False
 
-    normalized_terms = [term.lower().strip() for term in exclude_terms if term.strip()]
-    if not normalized_terms:
-        return False
-
-    name = str(details.get("name", "")).lower()
-    types_blob = " ".join(details.get("types", [])).lower()
-
-    for term in normalized_terms:
-        if term in name or term in types_blob:
+    haystack = f"{name} {category_text}".lower()
+    for term in exclude_terms:
+        t = term.strip().lower()
+        if t and t in haystack:
             return True
-
     return False
 
 
-def collect_businesses(
-    api_key: str,
-    queries: List[str],
-    location: str,
-    radius: int,
+def scrape_business_details(page, source_query: str, exclude_terms: List[str]) -> Optional[Dict]:
+    try:
+        page.wait_for_selector("h1", timeout=10000)
+    except PlaywrightTimeoutError:
+        return None
+
+    name = extract_first_text(page, ["h1.DUwDvf", "h1"])
+    if not name:
+        return None
+
+    category_text = extract_first_text(
+        page,
+        [
+            "button[jsaction*='pane.rating.category']",
+            "button.DkEaL",
+            "div[role='main'] button:has-text('·')",
+        ],
+    ) or ""
+
+    if should_exclude(name, category_text, exclude_terms):
+        return None
+
+    address = extract_first_text(page, ["button[data-item-id='address']", "div[data-item-id='address']"])
+    phone = extract_first_text(page, ["button[data-item-id^='phone']", "div[data-item-id^='phone']"])
+
+    website = None
+    website_loc = page.locator("a[data-item-id='authority']").first
+    if website_loc.count() > 0:
+        href = website_loc.get_attribute("href")
+        if href:
+            website = href.strip()
+
+    rating = None
+    rating_loc = page.locator("span[role='img'][aria-label*='yıldız'], span[role='img'][aria-label*='star']").first
+    if rating_loc.count() > 0:
+        aria_label = rating_loc.get_attribute("aria-label") or ""
+        rating = parse_rating(aria_label)
+
+    reviews_text = extract_first_text(
+        page,
+        [
+            "button[jsaction*='pane.reviewChart.moreReviews']",
+            "button[aria-label*='yorum']",
+            "button[aria-label*='review']",
+        ],
+    )
+    user_ratings_total = None
+    if reviews_text:
+        m = re.search(r"([0-9\.,]+)", reviews_text)
+        if m:
+            user_ratings_total = int(m.group(1).replace(".", "").replace(",", ""))
+
+    current_url = page.url
+    place_id = extract_place_id_from_url(current_url)
+
+    return {
+        "source_query": source_query,
+        "place_id": place_id,
+        "name": name,
+        "address": address,
+        "phone": phone,
+        "website": website,
+        "has_website": bool(website and website.strip()),
+        "rating": rating,
+        "user_ratings_total": user_ratings_total,
+        "types": category_text,
+        "business_status": None,
+        "google_maps_url": current_url,
+    }
+
+
+def scrape_query(
+    page,
+    query: str,
     max_results_per_query: int,
     exclude_terms: List[str],
+    seen_place_ids: Set[str],
+) -> List[Dict]:
+    url = f"{BASE_MAPS_SEARCH_URL}{quote(query)}"
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+    results: List[Dict] = []
+    feed = page.locator("div[role='feed']")
+    if feed.count() == 0:
+        return results
+
+    scrollable = feed.first
+    no_change_rounds = 0
+    last_count = 0
+
+    while len(results) < max_results_per_query and no_change_rounds < 8:
+        cards = page.locator("a[href*='/maps/place/']")
+        count = cards.count()
+
+        for i in range(count):
+            if len(results) >= max_results_per_query:
+                break
+
+            card = cards.nth(i)
+            href = card.get_attribute("href")
+            if not href:
+                continue
+
+            place_id_hint = extract_place_id_from_url(href) or href
+            if place_id_hint in seen_place_ids:
+                continue
+
+            try:
+                card.click(timeout=5000)
+                time.sleep(1.5)
+            except PlaywrightTimeoutError:
+                continue
+
+            details = scrape_business_details(page, query, exclude_terms)
+            if not details:
+                continue
+
+            real_place_id = details.get("place_id") or place_id_hint
+            if real_place_id in seen_place_ids:
+                continue
+
+            details["place_id"] = real_place_id
+            seen_place_ids.add(real_place_id)
+            results.append(details)
+
+        scrollable.evaluate("el => el.scrollBy(0, el.scrollHeight)")
+        time.sleep(1.5)
+
+        new_count = page.locator("a[href*='/maps/place/']").count()
+        if new_count == last_count:
+            no_change_rounds += 1
+        else:
+            no_change_rounds = 0
+            last_count = new_count
+
+    return results
+
+
+def collect_businesses(
+    queries: List[str],
+    max_results_per_query: int,
+    exclude_terms: List[str],
+    headless: bool,
 ) -> pd.DataFrame:
     rows: List[Dict] = []
     seen_place_ids: Set[str] = set()
 
-    for query in queries:
-        search_hits = text_search(api_key, query, location, radius, max_results_per_query)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context(locale="tr-TR")
+        page = context.new_page()
 
-        for hit in search_hits:
-            place_id = hit.get("place_id")
-            if not place_id or place_id in seen_place_ids:
-                continue
-
-            details = place_details(api_key, place_id)
-            if should_exclude(details, exclude_terms):
-                continue
-
-            seen_place_ids.add(place_id)
-            website = details.get("website")
-
-            rows.append(
-                {
-                    "source_query": query,
-                    "place_id": details.get("place_id"),
-                    "name": details.get("name"),
-                    "address": details.get("formatted_address"),
-                    "phone": details.get("formatted_phone_number"),
-                    "website": website,
-                    "has_website": bool(website and str(website).strip()),
-                    "rating": details.get("rating"),
-                    "user_ratings_total": details.get("user_ratings_total"),
-                    "types": ", ".join(details.get("types", [])),
-                    "business_status": details.get("business_status"),
-                    "google_maps_url": details.get("url"),
-                }
+        for query in queries:
+            query_rows = scrape_query(
+                page=page,
+                query=query,
+                max_results_per_query=max_results_per_query,
+                exclude_terms=exclude_terms,
+                seen_place_ids=seen_place_ids,
             )
+            rows.extend(query_rows)
+
+        context.close()
+        browser.close()
 
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -247,7 +314,7 @@ def export_excel(df: pd.DataFrame, output_path: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Google Maps işletme verisi toplayıp Excel'e aktarır.")
+    parser = argparse.ArgumentParser(description="Google Maps scraping ile işletme verisi toplayıp Excel'e aktarır.")
 
     parser.add_argument("--country", required=True, help="Ülke adı (örn: Turkey)")
     parser.add_argument("--city", required=True, help="Şehir adı (örn: Istanbul)")
@@ -262,25 +329,18 @@ def parse_args() -> argparse.Namespace:
         help="Virgülle ayrılmış hariç tutulacak kategori/terimler (örn: bar,night_club,casino)",
     )
 
-    parser.add_argument("--location", help="Opsiyonel: lat,lng. Verilirse geocode yerine bu kullanılır")
-    parser.add_argument("--radius", type=int, default=5000, help="Arama yarıçapı (metre)")
     parser.add_argument("--max-results-per-query", type=int, default=60, help="Her sorgu için maksimum işletme")
     parser.add_argument("--output", default="output/businesses.xlsx", help="Excel çıktı dosyası")
+    parser.add_argument("--headed", action="store_true", help="Tarayıcıyı görünür modda aç")
     return parser.parse_args()
 
 
 def main() -> None:
-    load_dotenv()
     args = parse_args()
-
-    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-    if not api_key:
-        raise EnvironmentError("GOOGLE_MAPS_API_KEY bulunamadı. Lütfen .env dosyanızı kontrol edin.")
 
     keywords = load_keywords_from_txt(args.keywords_file)
     exclude_terms = [item.strip() for item in args.exclude_categories.split(",") if item.strip()]
 
-    location = args.location or geocode_city_country(api_key, args.city, args.country)
     queries = build_queries(
         city=args.city,
         country=args.country,
@@ -290,19 +350,17 @@ def main() -> None:
     )
 
     df = collect_businesses(
-        api_key=api_key,
         queries=queries,
-        location=location,
-        radius=args.radius,
         max_results_per_query=args.max_results_per_query,
         exclude_terms=exclude_terms,
+        headless=not args.headed,
     )
 
     export_excel(df, args.output)
     total = len(df)
     no_website_count = int((~df["has_website"]).sum()) if total else 0
 
-    print(f"Konum: {args.city}, {args.country} | center={location}")
+    print(f"Konum: {args.city}, {args.country}")
     print(f"Sorgu sayısı: {len(queries)}")
     print(f"Toplam işletme: {total}")
     print(f"Websitesi olmayan işletme: {no_website_count}")
