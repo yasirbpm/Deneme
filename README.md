@@ -13,6 +13,7 @@ Bu proje Google Maps verisini **API kullanmadan web scraping** ile toplar ve Exc
   - `all_businesses`
   - `no_website`
 - Excel auto-filter aktif (özellikle `has_website` kolonu için)
+- **Yeni:** Streamlit UI (`ui.py`) ile Chrome sekmesinden arama başlatma ve Excel indirme
 
 ## Kurulum
 ```bash
@@ -22,7 +23,21 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-## Örnek Kullanım
+## Streamlit UI (önerilen kullanım)
+Uygulamayı tarayıcıdan çalıştırmak için:
+
+```bash
+streamlit run ui.py
+```
+
+UI davranışı:
+- Country dropdown: `pycountry` ile insan okunur ülke adları (arka planda ISO2 kod)
+- City dropdown: seçilen ülkeye bağlı şehir listesi (`geonamescache` offline dataset)
+- Varsayılanlar: Country=`Turkey (TR)`, City=`Istanbul`
+- `Start` ile scraper çalışır, sonuçlar tabloda gösterilir
+- `Download Excel` ile dosya diske yazmadan (`BytesIO`) indirilir
+
+## CLI Örnek Kullanım
 ### 1) İstanbul otelleri
 ```bash
 python app.py \
@@ -62,7 +77,7 @@ python app.py \
   --output output/antalya_hotels.xlsx
 ```
 
-## Parametreler
+## CLI Parametreler
 - `--country` (zorunlu)
 - `--city` (zorunlu)
 - `--category` (opsiyonel)

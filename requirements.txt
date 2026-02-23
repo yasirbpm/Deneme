@@ -1,3 +1,6 @@
 pandas==2.2.2
 openpyxl==3.1.5
 playwright==1.46.0
+streamlit==1.39.0
+pycountry==24.6.1
+geonamescache==2.0.0
