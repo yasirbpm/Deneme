@@ -1,5 +1,7 @@
 import argparse
+import asyncio
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -9,6 +11,8 @@ from openpyxl.utils import get_column_letter
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
 def load_keywords_from_txt(path: Optional[str]) -> List[str]:

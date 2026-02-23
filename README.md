@@ -94,3 +94,5 @@ python app.py \
 
 ## Not
 Google Maps arayüzü dinamik olduğu için bazı selector'ler zamanla değişebilir; gerekirse `app.py` içindeki selector listeleri güncellenmelidir.
+
+Windows + Streamlit kullanımında Playwright kaynaklı asyncio hatasını önlemek için proje içinde Windows'ta `WindowsProactorEventLoopPolicy` otomatik uygulanır.
