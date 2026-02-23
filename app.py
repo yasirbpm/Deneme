@@ -3,15 +3,12 @@ import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
-from urllib.parse import quote
 
 import pandas as pd
 from openpyxl.utils import get_column_letter
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-
-BASE_MAPS_SEARCH_URL = "https://www.google.com/maps/search/"
 
 
 def load_keywords_from_txt(path: Optional[str]) -> List[str]:
@@ -191,8 +188,7 @@ def scrape_query(
     exclude_terms: List[str],
     seen_place_ids: Set[str],
 ) -> List[Dict]:
-    url = f"{BASE_MAPS_SEARCH_URL}{quote(query)}"
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=120000)
 
     for consent_text in ["Accept all", "I agree", "Tümünü kabul et"]:
         try:
@@ -202,18 +198,43 @@ def scrape_query(
         except PlaywrightTimeoutError:
             continue
 
+    search_selectors = [
+        "input#searchboxinput",
+        "input[aria-label*='Search']",
+        "input[aria-label*='ara']",
+    ]
+
+    search_input = None
+    for selector in search_selectors:
+        locator = page.locator(selector).first
+        if locator.count() > 0:
+            search_input = locator
+            break
+
     results: List[Dict] = []
+    if search_input is None:
+        print(f"[DEBUG] Search input not found for query: {query}")
+        page.screenshot(path="debug_nav.png", full_page=True)
+        print(f"[DEBUG] Current URL: {page.url}")
+        return results
+
+    search_input.click(timeout=10000)
+    search_input.fill(query)
+    search_input.press("Enter")
+
     try:
-        page.wait_for_selector("div[role='feed']", timeout=60000)
+        page.wait_for_selector("div[role='feed'], a[href^='https://www.google.com/maps/place/']", timeout=60000)
     except PlaywrightTimeoutError:
-        print(f"[DEBUG] Results feed not found for query: {query}")
-        page.screenshot(path="debug.png", full_page=True)
+        print(f"[DEBUG] Results not found for query: {query}")
+        page.screenshot(path="debug_nav.png", full_page=True)
+        print(f"[DEBUG] Current URL: {page.url}")
         return results
 
     feed = page.locator("div[role='feed']")
     if feed.count() == 0:
         print(f"[DEBUG] Results feed locator is empty for query: {query}")
-        page.screenshot(path="debug.png", full_page=True)
+        page.screenshot(path="debug_nav.png", full_page=True)
+        print(f"[DEBUG] Current URL: {page.url}")
         return results
 
     scrollable = feed.first
