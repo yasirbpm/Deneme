@@ -192,53 +192,91 @@ def scrape_query(
     exclude_terms: List[str],
     seen_place_ids: Set[str],
 ) -> List[Dict]:
-    page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=120000)
-
-    for consent_text in ["Accept all", "I agree", "Tümünü kabul et"]:
-        try:
-            page.get_by_role("button", name=consent_text, exact=False).first.click(timeout=3000)
-            time.sleep(1)
-            break
-        except PlaywrightTimeoutError:
-            continue
+    page.goto("https://www.google.com/maps?hl=tr&gl=TR", wait_until="domcontentloaded", timeout=120000)
 
     search_selectors = [
         "input#searchboxinput",
+        "textarea#searchboxinput",
+        "[role='combobox'] input",
+        "input[aria-label*='Google Haritalar']",
         "input[aria-label*='Search']",
         "input[aria-label*='ara']",
     ]
 
-    search_input = None
-    for selector in search_selectors:
-        locator = page.locator(selector).first
-        if locator.count() > 0:
-            search_input = locator
-            break
+    def try_submit_search() -> bool:
+        search_input = None
+        for selector in search_selectors:
+            locator = page.locator(selector).first
+            if locator.count() > 0:
+                search_input = locator
+                break
+
+        if search_input is None:
+            return False
+
+        search_input.click(timeout=10000)
+        search_input.fill("")
+        search_input.type(query, delay=50)
+        search_input.press("Enter")
+        return True
 
     results: List[Dict] = []
-    if search_input is None:
+    try:
+        page.wait_for_selector(
+            "input#searchboxinput, textarea#searchboxinput, [role='combobox'] input, input[aria-label*='Google Haritalar'], input[aria-label*='Search'], input[aria-label*='ara']",
+            timeout=30000,
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    if not try_submit_search():
         print(f"[DEBUG] Search input not found for query: {query}")
-        page.screenshot(path="debug_nav.png", full_page=True)
+        output_dir = Path("output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(output_dir / "debug_search.png"), full_page=True)
+        (output_dir / "debug_search.html").write_text(page.content(), encoding="utf-8")
         print(f"[DEBUG] Current URL: {page.url}")
         return results
-
-    search_input.click(timeout=10000)
-    search_input.fill(query)
-    search_input.press("Enter")
 
     try:
         page.wait_for_selector("div[role='feed'], a[href^='https://www.google.com/maps/place/']", timeout=60000)
     except PlaywrightTimeoutError:
-        print(f"[DEBUG] Results not found for query: {query}")
-        page.screenshot(path="debug_nav.png", full_page=True)
-        print(f"[DEBUG] Current URL: {page.url}")
-        return results
+        for consent_text in ["Accept all", "I agree", "Tümünü kabul et"]:
+            try:
+                page.get_by_role("button", name=consent_text, exact=False).first.click(timeout=3000)
+                time.sleep(1)
+                break
+            except PlaywrightTimeoutError:
+                continue
+
+        if try_submit_search():
+            try:
+                page.wait_for_selector("div[role='feed'], a[href^='https://www.google.com/maps/place/']", timeout=60000)
+            except PlaywrightTimeoutError:
+                print("Search did not trigger, saving debug artifacts")
+                print(f"[DEBUG] Current URL: {page.url}")
+                output_dir = Path("output")
+                output_dir.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(output_dir / "debug_search.png"), full_page=True)
+                (output_dir / "debug_search.html").write_text(page.content(), encoding="utf-8")
+                return results
+        else:
+            print("Search did not trigger, saving debug artifacts")
+            print(f"[DEBUG] Current URL: {page.url}")
+            output_dir = Path("output")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(output_dir / "debug_search.png"), full_page=True)
+            (output_dir / "debug_search.html").write_text(page.content(), encoding="utf-8")
+            return results
 
     feed = page.locator("div[role='feed']")
     if feed.count() == 0:
-        print(f"[DEBUG] Results feed locator is empty for query: {query}")
-        page.screenshot(path="debug_nav.png", full_page=True)
+        print("Search did not trigger, saving debug artifacts")
         print(f"[DEBUG] Current URL: {page.url}")
+        output_dir = Path("output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(output_dir / "debug_search.png"), full_page=True)
+        (output_dir / "debug_search.html").write_text(page.content(), encoding="utf-8")
         return results
 
     scrollable = feed.first
