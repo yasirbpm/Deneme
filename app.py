@@ -194,9 +194,26 @@ def scrape_query(
     url = f"{BASE_MAPS_SEARCH_URL}{quote(query)}"
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
+    for consent_text in ["Accept all", "I agree", "Tümünü kabul et"]:
+        try:
+            page.get_by_role("button", name=consent_text, exact=False).first.click(timeout=3000)
+            time.sleep(1)
+            break
+        except PlaywrightTimeoutError:
+            continue
+
     results: List[Dict] = []
+    try:
+        page.wait_for_selector("div[role='feed']", timeout=60000)
+    except PlaywrightTimeoutError:
+        print(f"[DEBUG] Results feed not found for query: {query}")
+        page.screenshot(path="debug.png", full_page=True)
+        return results
+
     feed = page.locator("div[role='feed']")
     if feed.count() == 0:
+        print(f"[DEBUG] Results feed locator is empty for query: {query}")
+        page.screenshot(path="debug.png", full_page=True)
         return results
 
     scrollable = feed.first
